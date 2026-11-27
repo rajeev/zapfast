@@ -3072,6 +3072,57 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                 app.scroll_to_bottom = true;
                 app.timer_saving.insert(chat.to_owned());
             }
+            "screenshot" => {
+                app.dialog = app.open_chat.clone().map(|chat| Dialog::Screenshot {
+                    chat,
+                    message: "ada-format".to_owned(),
+                });
+            }
+            "screenshot-capture" | "screenshot-share" | "screenshot-view" => {
+                if let Some(chat) = app.open_chat.clone()
+                    && let Some(last) = app
+                        .conversations
+                        .get(&chat)
+                        .and_then(|conversation| conversation.messages.last())
+                        .map(|message| message.id.clone())
+                {
+                    let mut capture = crate::screenshot::Capture::new(
+                        app.account().id.clone(),
+                        chat.clone(),
+                        "ada-format".to_owned(),
+                        last,
+                        false,
+                    );
+                    if part == "screenshot-share" {
+                        capture.phase = crate::screenshot::Phase::Done {
+                            paths: (1..=3)
+                                .map(|page| {
+                                    std::path::PathBuf::from(format!("screenshot-{page:02}.png"))
+                                })
+                                .collect(),
+                            thumbnails: Vec::new(),
+                        };
+                        app.dialog = Some(Dialog::ShareScreenshots(chat));
+                    } else if part == "screenshot-view" {
+                        // Real files, so the page shown full size has a
+                        // picture: plain pages in the chat's colours.
+                        let folder = crate::screenshot::folder(&app.account().dirs.cache);
+                        let pages: Vec<_> = [app.palette.chat, app.palette.panel, app.palette.chat]
+                            .into_iter()
+                            .map(|fill| egui::ColorImage::filled([780, 1690], fill))
+                            .collect();
+                        let paths =
+                            crate::screenshot::write_pages(&folder, &pages).unwrap_or_default();
+                        capture.phase = crate::screenshot::Phase::Done {
+                            paths,
+                            thumbnails: Vec::new(),
+                        };
+                        capture.view(Some(0));
+                        app.dialog = Some(Dialog::ShareScreenshots(chat));
+                    }
+                    app.screenshot = Some(capture);
+                }
+            }
             "forward" | "forward-selected" | "forward-review" | "forward-full" | "forward-once" => {
                 app.dialog = app.open_chat.clone().map(|chat| Dialog::Forward {
                     chat,
@@ -8821,6 +8872,309 @@ mod tests {
         }
     }
 
+    /// A screenshot from a message to the end of the chat lays the rows out
+    /// at a phone's width, cuts them into portrait pages, writes them, and
+    /// offers them in the chat picker, which sends every page to each chat
+    /// picked, in order.
+    #[test]
+    fn screenshots_are_taken_page_by_page_and_sent_to_the_chats_picked() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let chat = app
+            .conversations
+            .iter()
+            .find(|(_, conversation)| {
+                conversation
+                    .messages
+                    .iter()
+                    .any(|message| message.id == "ada-format")
+            })
+            .map(|(chat, _)| chat.clone())
+            .expect("the sample has the message");
+        app.open_chat = Some(chat.clone());
+        render(&mut app, &ctx);
+        app.actions.push(crate::model::Action::ShowDialog(
+            crate::model::Dialog::Screenshot {
+                chat: chat.clone(),
+                message: "ada-format".into(),
+            },
+        ));
+        render(&mut app, &ctx);
+        render(&mut app, &ctx);
+        app.actions.push(crate::model::Action::TakeScreenshot {
+            chat: chat.clone(),
+            message: "ada-format".into(),
+            to_end: true,
+        });
+        render(&mut app, &ctx);
+        assert_eq!(app.dialog, None, "the choice gives way to the capture");
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1180.0, 980.0));
+        let mut events = Vec::new();
+        let mut asked = 0;
+        for _ in 0..600 {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    events: std::mem::take(&mut events),
+                    ..Default::default()
+                },
+                |ui| {
+                    let ctx = ui.ctx().clone();
+                    app.background_frame(&ctx);
+                    app.frame_ui(ui);
+                },
+            );
+            output.textures_delta.clear();
+            for command in output
+                .viewport_output
+                .remove(&egui::ViewportId::ROOT)
+                .map(|viewport| viewport.commands)
+                .unwrap_or_default()
+            {
+                if let egui::ViewportCommand::Screenshot(user_data) = command {
+                    asked += 1;
+                    // The window's picture, as eframe would hand it back.
+                    events.push(egui::Event::Screenshot {
+                        viewport_id: egui::ViewportId::ROOT,
+                        user_data,
+                        image: std::sync::Arc::new(egui::ColorImage::filled(
+                            [screen.width() as usize, screen.height() as usize],
+                            egui::Color32::from_rgb(10, 20, 30),
+                        )),
+                    });
+                }
+            }
+            if matches!(app.dialog, Some(crate::model::Dialog::ShareScreenshots(_))) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            app.dialog,
+            Some(crate::model::Dialog::ShareScreenshots(chat.clone()))
+        );
+        // Nobody is picked until the reader picks.
+        assert!(app.forward_recipients.is_empty());
+        assert!(!app.forward_reviewing);
+        let Some(crate::screenshot::Phase::Done { paths, thumbnails }) =
+            app.screenshot.as_ref().map(|capture| &capture.phase)
+        else {
+            panic!("the pages are offered");
+        };
+        assert_eq!(paths.len(), asked, "one picture a page");
+        assert_eq!(thumbnails.len(), paths.len());
+        for path in paths {
+            let page = image::open(path).unwrap();
+            assert_eq!(page.width(), crate::screenshot::PAGE_WIDTH as u32);
+            assert!(page.height() <= crate::screenshot::PAGE_HEIGHT as u32);
+            assert!(page.height() > page.width() || path == paths.last().unwrap());
+        }
+        let paths = paths.clone();
+        render(&mut app, &ctx);
+
+        let (backend, mut commands) = crate::backend::Backend::recording();
+        app.backend = backend;
+        let recipients: Vec<_> = app
+            .chats
+            .iter()
+            .filter(|chat| crate::ui::dialogs::forwardable(chat))
+            .map(|chat| chat.id.clone())
+            .take(2)
+            .collect();
+        for recipient in &recipients {
+            app.actions
+                .push(crate::model::Action::ToggleForwardRecipient(
+                    recipient.clone(),
+                ));
+            render(&mut app, &ctx);
+        }
+        // Several chats are confirmed first, as a forward is.
+        app.actions.push(crate::model::Action::ConfirmForward);
+        render(&mut app, &ctx);
+        assert!(
+            !std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, crate::backend::Command::SendFiles { .. }))
+        );
+        app.actions.push(crate::model::Action::ReviewForward);
+        render(&mut app, &ctx);
+        app.actions.push(crate::model::Action::ConfirmForward);
+        render(&mut app, &ctx);
+        let sent: Vec<_> = std::iter::from_fn(|| commands.try_recv().ok())
+            .filter_map(|command| match command {
+                crate::backend::Command::SendFiles {
+                    chat,
+                    paths,
+                    documents: false,
+                    ..
+                } => Some((chat, paths)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            recipients
+                .iter()
+                .map(|chat| (chat.clone(), paths.clone()))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(app.dialog, None);
+        assert!(app.screenshot.is_none());
+    }
+
+    /// Offers `count` saved pages in the chat picker, with their thumbnails,
+    /// as a finished capture leaves them.
+    fn offer_pages(app: &mut App, ctx: &egui::Context, count: usize) -> Vec<std::path::PathBuf> {
+        let chat = app.chats[0].id.clone();
+        app.open_chat = Some(chat.clone());
+        let images: Vec<_> = (0..count)
+            .map(|page| {
+                egui::ColorImage::filled([390, 800], egui::Color32::from_gray(40 + page as u8 * 40))
+            })
+            .collect();
+        let folder = crate::screenshot::folder(&app.account().dirs.cache);
+        let paths = crate::screenshot::write_pages(&folder, &images).unwrap();
+        let mut capture = crate::screenshot::Capture::new(
+            app.account().id.clone(),
+            chat.clone(),
+            "a".into(),
+            "b".into(),
+            false,
+        );
+        capture.phase = crate::screenshot::Phase::Done {
+            paths: paths.clone(),
+            thumbnails: images
+                .into_iter()
+                .enumerate()
+                .map(|(page, image)| {
+                    ctx.load_texture(format!("test-page-{page}"), image, Default::default())
+                })
+                .collect(),
+        };
+        app.screenshot = Some(capture);
+        app.dialog = Some(crate::model::Dialog::ShareScreenshots(chat));
+        render(app, ctx);
+        paths
+    }
+
+    fn viewing(app: &App) -> Option<usize> {
+        app.screenshot.as_ref().and_then(|capture| capture.viewing)
+    }
+
+    /// A thumbnail in the picker opens its page full size. The arrows step
+    /// through the pages and stop at the ends, and Escape goes back to the
+    /// picker, which stays open with its pages.
+    #[test]
+    fn a_screenshot_page_opens_full_size_from_its_thumbnail() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.attach(&ctx);
+        offer_pages(&mut app, &ctx, 3);
+        click_review_button(&mut app, &ctx, "Page 2 of 3");
+        assert_eq!(viewing(&app), Some(1));
+        press_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert_eq!(viewing(&app), Some(2));
+        press_key(&mut app, &ctx, egui::Key::ArrowRight, egui::Modifiers::NONE);
+        assert_eq!(viewing(&app), Some(2), "nothing comes after the last page");
+        press_key(&mut app, &ctx, egui::Key::ArrowLeft, egui::Modifiers::NONE);
+        assert_eq!(viewing(&app), Some(1));
+        press_key(&mut app, &ctx, egui::Key::Escape, egui::Modifiers::NONE);
+        assert_eq!(viewing(&app), None);
+        assert!(
+            matches!(app.dialog, Some(crate::model::Dialog::ShareScreenshots(_))),
+            "Escape goes back to the picker, not past it"
+        );
+        assert!(app.screenshot.is_some(), "the pages are still offered");
+        click_review_button(&mut app, &ctx, "Page 1 of 3");
+        click_review_button(&mut app, &ctx, "Close preview (Esc)");
+        assert_eq!(viewing(&app), None);
+        assert!(matches!(
+            app.dialog,
+            Some(crate::model::Dialog::ShareScreenshots(_))
+        ));
+    }
+
+    /// The picker saves every page to a folder, and the page shown full size
+    /// saves itself, each under its own file's name.
+    #[test]
+    fn screenshot_pages_save_from_the_picker_and_full_size() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        app.attach(&ctx);
+        let paths = offer_pages(&mut app, &ctx, 2);
+        let (backend, mut commands) = crate::backend::Backend::recording();
+        app.backend = backend;
+        let saves =
+            |commands: &mut tokio::sync::mpsc::UnboundedReceiver<crate::backend::Command>| {
+                std::iter::from_fn(|| commands.try_recv().ok())
+                    .filter(|command| {
+                        matches!(
+                            command,
+                            crate::backend::Command::SaveAttachments { .. }
+                                | crate::backend::Command::SaveAttachmentAs { .. }
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            };
+        click_review_button(&mut app, &ctx, "Save all…");
+        let named = |path: &std::path::PathBuf| {
+            (
+                path.clone(),
+                path.file_name().unwrap().to_string_lossy().into_owned(),
+            )
+        };
+        assert!(matches!(
+            saves(&mut commands).as_slice(),
+            [crate::backend::Command::SaveAttachments { files }]
+                if *files == paths.iter().map(named).collect::<Vec<_>>()
+        ));
+        click_review_button(&mut app, &ctx, "Page 2 of 2");
+        click_review_button(&mut app, &ctx, "Save as…");
+        assert!(matches!(
+            saves(&mut commands).as_slice(),
+            [crate::backend::Command::SaveAttachmentAs { source, name }]
+                if (source.clone(), name.clone()) == named(&paths[1])
+        ));
+        assert_eq!(viewing(&app), Some(1), "saving leaves the page on screen");
+    }
+
+    /// A screenshot under way stops when the reader leaves its chat.
+    #[test]
+    fn a_screenshot_stops_when_its_chat_closes() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let chat = app.open_chat.clone().expect("the sample opens a chat");
+        let message = app.conversations[&chat].messages[0].id.clone();
+        render(&mut app, &ctx);
+        app.actions.push(crate::model::Action::TakeScreenshot {
+            chat,
+            message,
+            to_end: false,
+        });
+        render(&mut app, &ctx);
+        assert!(app.screenshot.is_some());
+        render(&mut app, &ctx);
+        app.open_chat = None;
+        render(&mut app, &ctx);
+        assert!(app.screenshot.is_none());
+
+        // A locked chat is kept out of the plain files pages are.
+        let locked = app.chats[0].id.clone();
+        app.chats[0].locked = true;
+        app.open_chat = Some(locked.clone());
+        let message = app.conversations[&locked].messages[0].id.clone();
+        app.actions.push(crate::model::Action::TakeScreenshot {
+            chat: locked,
+            message,
+            to_end: true,
+        });
+        render(&mut app, &ctx);
+        assert!(app.screenshot.is_none());
+    }
+
     #[test]
     fn f_opens_the_forward_dialog_for_the_focused_message() {
         let mut app = app();
@@ -9745,6 +10099,10 @@ mod tests {
             "forward-review",
             "forward-full",
             "forward-once",
+            "screenshot",
+            "screenshot-capture",
+            "screenshot-share",
+            "screenshot-view",
             "unlink",
             "leave-group",
             "left-group",

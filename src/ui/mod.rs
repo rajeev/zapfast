@@ -50,9 +50,22 @@ pub fn show(app: &mut App, ui: &mut egui::Ui) {
     // Locked, nothing else is drawn: no chat list, no messages, no dialogs,
     // no toasts, and no shortcut reaches them.
     if app.app_lock.is_locked() {
+        // Pages are not taken behind the lock screen.
+        if conversation::screenshot::active(app) {
+            app.screenshot = None;
+        }
         titlebar_strip(app, ui);
         lock::show(app, ui);
         focus_ring(app, ctx);
+        announce(app, ctx);
+        window_chrome(app, ui);
+        return;
+    }
+    // While screenshots are taken, the window shows only the page being
+    // taken: its bubbles are the transcript's, and must not meet it.
+    if conversation::screenshot::active(app) {
+        conversation::screenshot::show(app, ui);
+        toasts(app, ctx);
         announce(app, ctx);
         window_chrome(app, ui);
         return;

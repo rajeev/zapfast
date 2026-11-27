@@ -28,6 +28,10 @@ pub fn handle(app: &mut App, ctx: &egui::Context) {
         sticker_view_keys(app, ctx);
         return;
     }
+    if let Some(page) = viewed_screenshot(app) {
+        screenshot_view_keys(app, ctx, page);
+        return;
+    }
     let editing_text = ctx.text_edit_focused();
     let find = find_action(app);
     let archive = archive_action(app);
@@ -988,6 +992,33 @@ fn sticker_view_keys(app: &mut App, ctx: &egui::Context) {
     });
     if close {
         app.actions.push(Action::CloseStickerPreview);
+    }
+}
+
+/// The screenshot page shown full size over the chat picker, if any.
+fn viewed_screenshot(app: &App) -> Option<usize> {
+    matches!(app.dialog, Some(Dialog::ShareScreenshots(_)))
+        .then(|| app.screenshot.as_ref()?.viewing)
+        .flatten()
+}
+
+/// Handles keys while a screenshot page is shown full size: Escape goes back
+/// to the picker rather than closing it, and the arrows step through the
+/// pages.
+fn screenshot_view_keys(app: &mut App, ctx: &egui::Context, page: usize) {
+    let (close, previous, next) = ctx.input_mut(|input| {
+        (
+            input.consume_key(Modifiers::NONE, Key::Escape),
+            input.consume_key(Modifiers::NONE, Key::ArrowLeft),
+            input.consume_key(Modifiers::NONE, Key::ArrowRight),
+        )
+    });
+    if close {
+        app.actions.push(Action::ViewScreenshot(None));
+    } else if previous && page > 0 {
+        app.actions.push(Action::ViewScreenshot(Some(page - 1)));
+    } else if next {
+        app.actions.push(Action::ViewScreenshot(Some(page + 1)));
     }
 }
 

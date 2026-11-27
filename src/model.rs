@@ -2556,6 +2556,15 @@ pub enum Dialog {
         chat: ChatId,
         message: String,
     },
+    /// Asks whether to take a screenshot of one message, or of every
+    /// message from it to the end of the chat.
+    Screenshot {
+        chat: ChatId,
+        message: String,
+    },
+    /// Chooses the chats to send the screenshot pages just taken to, with
+    /// the Forward dialog's list. The pages are `App::screenshot`'s.
+    ShareScreenshots(ChatId),
     /// Picks people to add to a group, with New group's check boxes.
     AddGroupMembers(ChatId),
     /// Confirms revoking a group's invite link for a new one.
@@ -3006,6 +3015,22 @@ pub enum Action {
     /// Forwards to the chosen recipients: one at once, several after
     /// their confirmation.
     ConfirmForward,
+    /// Takes screenshots of `message` (and with `to_end`, every message
+    /// after it in the chat) for a phone, then offers to send them.
+    TakeScreenshot {
+        chat: ChatId,
+        message: String,
+        to_end: bool,
+    },
+    /// Stops a screenshot under way, or drops the pages taken.
+    CancelScreenshot,
+    /// The screenshot pages are written; offers them to send.
+    ScreenshotsTaken,
+    /// Taking or writing the screenshots failed.
+    ScreenshotFailed(String),
+    /// Shows a screenshot page full size over the chat picker, by its index,
+    /// or goes back to the picker.
+    ViewScreenshot(Option<usize>),
     /// Starts selecting messages in the open chat, beginning with this one.
     SelectMessage(String),
     /// Adds a message to the selection or removes it.

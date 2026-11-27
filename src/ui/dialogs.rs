@@ -20,11 +20,13 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
         .fill(palette.overlay)
         .stroke(Stroke::new(1.0, palette.outline))
         .corner_radius(CornerRadius::same(theme::RADIUS + 4))
-        .inner_margin(Margin::same(if matches!(dialog, Dialog::Forward { .. }) {
-            12
-        } else {
-            22
-        }))
+        .inner_margin(Margin::same(
+            if matches!(dialog, Dialog::Forward { .. } | Dialog::ShareScreenshots(_)) {
+                12
+            } else {
+                22
+            },
+        ))
         .shadow(palette.modal_shadow());
     let response = egui::Modal::new(modal_id())
         .frame(frame)
@@ -58,7 +60,8 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 Dialog::ConfirmRemoveStickerPack { .. } => 380.0,
                 Dialog::StickerPack => 420.0,
                 Dialog::StickerMaker => 400.0,
-                Dialog::Forward { .. } => {
+                Dialog::Screenshot { .. } => 380.0,
+                Dialog::Forward { .. } | Dialog::ShareScreenshots(_) => {
                     let width = ui.ctx().content_rect().width();
                     (width * 0.6)
                         .clamp(420.0, 760.0)
@@ -124,7 +127,22 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
                 } => {
                     confirm_delete_messages(app, ui, &chat, &messages, for_everyone, true);
                 }
-                Dialog::Forward { messages, .. } => forward(app, ui, &messages),
+                Dialog::Forward { messages, .. } => {
+                    let heading = if messages.len() == 1 {
+                        crate::i18n::gettext(app.locale, "Forward message").into_owned()
+                    } else {
+                        crate::i18n::ngettext(
+                            app.locale,
+                            "Forward {count} message",
+                            "Forward {count} messages",
+                            messages.len() as u32,
+                        )
+                        .replace("{count}", &messages.len().to_string())
+                    };
+                    forward(app, ui, &heading, Sending::Messages);
+                }
+                Dialog::Screenshot { chat, message } => screenshot_choice(app, ui, &chat, &message),
+                Dialog::ShareScreenshots(_) => share_screenshots(app, ui),
                 Dialog::JoinGroup => join_group(app, ui),
                 Dialog::ConfirmStartOver => confirm_start_over(app, ui),
                 Dialog::StickerPack => sticker_pack(app, ui),
@@ -156,6 +174,11 @@ pub fn show(app: &mut App, ctx: &egui::Context) {
     }
     if response.should_close() {
         app.actions.push(Action::CloseDialog);
+    }
+    // Over the picker, in a modal of its own: Escape or a click outside goes
+    // back to the picker, never past it.
+    if matches!(app.dialog, Some(Dialog::ShareScreenshots(_))) {
+        screenshot_page(app, ctx);
     }
 }
 
@@ -610,7 +633,377 @@ pub(super) fn contact_choices(app: &App, needle: &str) -> Vec<crate::model::Cont
 
 /// Draws recipient selection or, for two or more recipients, their
 /// confirmation. A single recipient is forwarded to without one.
-fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
+/// What the chat picker sends: archived messages forwarded, or screenshot
+/// pages sent as new pictures.
+#[derive(Clone, Copy, PartialEq)]
+enum Sending {
+    Messages,
+    Screenshots,
+}
+
+/// Asks whether to take the message alone or every message from it to the
+/// end of the chat.
+fn screenshot_choice(app: &mut App, ui: &mut egui::Ui, chat: &str, message: &str) {
+    let palette = app.palette;
+    let locale = app.locale;
+    title(ui, app, &crate::i18n::gettext(locale, "Screenshot"));
+    theme::paragraph(
+        ui,
+        crate::i18n::gettext(
+            locale,
+            "Make pictures sized for a phone screen, then choose chats to send them to.",
+        ),
+        theme::regular(13.5),
+        palette.secondary,
+    );
+    ui.add_space(6.0);
+    let choices = [
+        (crate::i18n::gettext(locale, "This message"), false),
+        (
+            crate::i18n::gettext(locale, "From this message to the end of the chat"),
+            true,
+        ),
+    ];
+    for (label, to_end) in choices {
+        let (rect, response) =
+            ui.allocate_exact_size(vec2(ui.available_width(), 40.0), Sense::click());
+        theme::reveal_focus(&response);
+        response.widget_info(|| {
+            egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), label.as_ref())
+        });
+        if response.hovered() || response.has_focus() {
+            super::widgets::dialog_row_highlight(ui, rect, palette.surface_hover);
+        }
+        let line = super::widgets::line(
+            ui,
+            &label,
+            theme::regular(14.5),
+            palette.text,
+            rect.width() - 24.0,
+            1,
+        );
+        line.paint(
+            ui,
+            pos2(rect.left() + 12.0, rect.center().y - line.size().y / 2.0),
+            palette.text,
+        );
+        if response
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        {
+            app.actions.push(Action::TakeScreenshot {
+                chat: chat.to_owned(),
+                message: message.to_owned(),
+                to_end,
+            });
+        }
+    }
+    cancel_row(app, ui);
+}
+
+/// The chat picker for the screenshot pages just taken, with the pages
+/// along its top.
+fn share_screenshots(app: &mut App, ui: &mut egui::Ui) {
+    let Some(crate::screenshot::Phase::Done { paths, .. }) =
+        app.screenshot.as_ref().map(|capture| &capture.phase)
+    else {
+        app.actions.push(Action::CloseDialog);
+        return;
+    };
+    let count = paths.len();
+    let heading = crate::i18n::ngettext(
+        app.locale,
+        "Send {count} screenshot",
+        "Send {count} screenshots",
+        count as u32,
+    )
+    .replace("{count}", &count.to_string());
+    forward(app, ui, &heading, Sending::Screenshots);
+}
+
+/// "Page 2 of 4": a screenshot page's name, on its thumbnail and over it
+/// full size.
+fn page_label(locale: crate::i18n::Locale, page: usize, count: usize) -> String {
+    crate::i18n::gettext(locale, "Page {page} of {count}")
+        .replace("{page}", &(page + 1).to_string())
+        .replace("{count}", &count.to_string())
+}
+
+/// The name a saved screenshot page is offered under: its own file's.
+fn page_file_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("screenshot.png")
+        .to_owned()
+}
+
+/// The pages taken, small, in a row that scrolls sideways. A click shows one
+/// full size, and the button under them saves them to a folder of the
+/// reader's choice.
+fn screenshot_strip(app: &mut App, ui: &mut egui::Ui) {
+    let Some(capture) = app.screenshot.as_ref() else {
+        return;
+    };
+    let crate::screenshot::Phase::Done { paths, thumbnails } = &capture.phase else {
+        return;
+    };
+    let locale = app.locale;
+    let palette = app.palette;
+    let count = paths.len();
+    let mut actions = Vec::new();
+    const HEIGHT: f32 = 120.0;
+    egui::ScrollArea::horizontal()
+        .id_salt("screenshot-strip")
+        .max_height(HEIGHT + 8.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                for (page, texture) in thumbnails.iter().enumerate() {
+                    let size = texture.size_vec2();
+                    let scale = HEIGHT / size.y.max(1.0);
+                    let name = page_label(locale, page, count);
+                    let response = ui
+                        .add(
+                            egui::Image::new((texture.id(), size * scale))
+                                .corner_radius(CornerRadius::same(4))
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text(&name);
+                    response.widget_info(|| {
+                        egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &name)
+                    });
+                    theme::reveal_focus(&response);
+                    theme::focus_outline(ui, response.id, response.rect, 4.0);
+                    if response.clicked() {
+                        actions.push(Action::ViewScreenshot(Some(page)));
+                    }
+                }
+            });
+        });
+    ui.add_space(4.0);
+    let save = if count == 1 {
+        crate::i18n::gettext(locale, "Save as…")
+    } else {
+        crate::i18n::gettext(locale, "Save all…")
+    };
+    if theme::pill_button(ui, &palette, &save, false).clicked() {
+        actions.push(save_pages(paths, None));
+    }
+    ui.add_space(4.0);
+    app.actions.extend(actions);
+}
+
+/// Saves one page (`Some`) under a name the reader chooses, or every page to
+/// a folder they choose; a single page is saved as itself either way. The
+/// copies never replace a file already there.
+fn save_pages(paths: &[std::path::PathBuf], page: Option<usize>) -> Action {
+    match page.or((paths.len() == 1).then_some(0)) {
+        Some(page) => Action::SaveAttachmentAs {
+            path: paths[page].clone(),
+            name: page_file_name(&paths[page]),
+        },
+        None => Action::SaveAttachments {
+            files: paths
+                .iter()
+                .map(|path| (path.clone(), page_file_name(path)))
+                .collect(),
+        },
+    }
+}
+
+/// The modal a screenshot page is shown full size on, over the picker.
+pub(crate) fn screenshot_page_id() -> egui::Id {
+    egui::Id::new("screenshot-page")
+}
+
+/// A screenshot page full size over the chat picker: at the size it was
+/// taken, narrowed only to fit the window's width and scrolled when the
+/// window is shorter, with Save as, the arrows between pages, and Close.
+/// Closing it goes back to the picker.
+fn screenshot_page(app: &mut App, ctx: &egui::Context) {
+    let Some(capture) = app.screenshot.as_ref() else {
+        return;
+    };
+    let Some(page) = capture.viewing else {
+        return;
+    };
+    let paths = capture.saved().to_vec();
+    let Some(path) = paths.get(page).cloned() else {
+        return;
+    };
+    let count = paths.len();
+    let palette = app.palette;
+    let locale = app.locale;
+    let mut actions = Vec::new();
+    let screen = ctx.content_rect();
+    let area = egui::Area::new(screenshot_page_id())
+        .order(egui::Order::Foreground)
+        .fixed_pos(screen.min);
+    let response = egui::Modal::new(screenshot_page_id())
+        .area(area)
+        .frame(Frame::new().fill(palette.overlay))
+        .backdrop_color(palette.shadow)
+        .show(ctx, |ui| {
+            ui.set_min_size(screen.size());
+            let window = Rect::from_min_size(screen.min, screen.size());
+            ui.painter().rect_filled(window, 0.0, palette.overlay);
+            // A click on the empty field goes back to the picker, as one
+            // outside a picture closes the image viewer.
+            let (_, backdrop) = ui.allocate_exact_size(window.size(), Sense::CLICK);
+            if backdrop.clicked() {
+                actions.push(Action::ViewScreenshot(None));
+            }
+            const HEADER: f32 = 56.0;
+            let header = Rect::from_min_size(window.min, vec2(window.width(), HEADER));
+            super::caption_drag(ui, header);
+            let room = super::caption_room(ui.ctx(), header, 0.0);
+            let inset = header.shrink2(vec2(14.0, 0.0));
+            let inset = Rect::from_min_max(
+                inset.min + vec2(room.left, 0.0),
+                inset.max - vec2(room.right, 0.0),
+            );
+            let mut head = ui.new_child(
+                egui::UiBuilder::new()
+                    .max_rect(inset)
+                    .layout(Layout::right_to_left(Align::Center)),
+            );
+            head.set_clip_rect(header);
+            if theme::icon_button(
+                &mut head,
+                Icon::X,
+                18.0,
+                palette.secondary,
+                palette.text,
+                &crate::i18n::gettext(locale, "Close preview (Esc)"),
+            )
+            .clicked()
+            {
+                actions.push(Action::ViewScreenshot(None));
+            }
+            if theme::icon_button(
+                &mut head,
+                Icon::Download,
+                18.0,
+                palette.secondary,
+                palette.text,
+                &crate::i18n::gettext(locale, "Save as…"),
+            )
+            .clicked()
+            {
+                actions.push(save_pages(&paths, Some(page)));
+            }
+            head.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(page_label(locale, page, count))
+                            .font(theme::semibold(15.0))
+                            .color(palette.text),
+                    )
+                    .truncate(),
+                );
+            });
+
+            let stage = Rect::from_min_max(window.min + vec2(0.0, HEADER), window.max);
+            let mut body = ui.new_child(egui::UiBuilder::new().max_rect(stage));
+            body.set_clip_rect(stage);
+            let image = super::widgets::file_image(&body, &path);
+            match image.load_for_size(ctx, stage.size()) {
+                Ok(egui::load::TexturePoll::Ready { texture }) => {
+                    // The page's own pixels at the window's scale: a page
+                    // taken at 2x is 390 points wide again on a 2x screen.
+                    let natural = texture.size / ctx.pixels_per_point();
+                    let fit = ((stage.width() - 32.0).max(1.0) / natural.x.max(1.0)).min(1.0);
+                    let size = natural * fit;
+                    egui::ScrollArea::vertical()
+                        .id_salt(("screenshot-page-scroll", page))
+                        .auto_shrink(false)
+                        .show(&mut body, |ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(8.0);
+                                // Sensed, so a click on the page itself
+                                // doesn't count as one on the field around it.
+                                ui.add(
+                                    egui::Image::new(egui::load::SizedTexture::new(
+                                        texture.id, size,
+                                    ))
+                                    .sense(Sense::CLICK),
+                                );
+                                ui.add_space(8.0);
+                            });
+                        });
+                }
+                Ok(_) => {
+                    body.put(
+                        stage,
+                        egui::Spinner::new().size(24.0).color(palette.secondary),
+                    );
+                }
+                Err(_) => {
+                    body.put(
+                        stage,
+                        egui::Label::new(
+                            egui::RichText::new(crate::i18n::gettext(
+                                locale,
+                                "ZapFast could not display this file",
+                            ))
+                            .color(palette.secondary),
+                        ),
+                    );
+                }
+            }
+
+            // The arrows between pages, at the stage's sides.
+            const ARROW: f32 = 44.0;
+            let middle = stage.center().y;
+            for (left, icon, hint, target) in [
+                (
+                    true,
+                    Icon::ChevronLeft,
+                    "Previous (Left arrow)",
+                    page.checked_sub(1),
+                ),
+                (
+                    false,
+                    Icon::ChevronRight,
+                    "Next (Right arrow)",
+                    (page + 1 < count).then_some(page + 1),
+                ),
+            ] {
+                let Some(target) = target else {
+                    continue;
+                };
+                let x = if left {
+                    stage.left() + 12.0
+                } else {
+                    stage.right() - 12.0 - ARROW
+                };
+                let rect = Rect::from_min_size(pos2(x, middle - ARROW / 2.0), vec2(ARROW, ARROW));
+                let mut arrow = ui.new_child(
+                    egui::UiBuilder::new()
+                        .max_rect(rect)
+                        .layout(Layout::centered_and_justified(egui::Direction::LeftToRight)),
+                );
+                if theme::icon_button(
+                    &mut arrow,
+                    icon,
+                    22.0,
+                    palette.secondary,
+                    palette.text,
+                    &crate::i18n::gettext(locale, hint),
+                )
+                .clicked()
+                {
+                    actions.push(Action::ViewScreenshot(Some(target)));
+                }
+            }
+        });
+    if response.should_close() {
+        actions.push(Action::ViewScreenshot(None));
+    }
+    app.actions.extend(actions);
+}
+
+fn forward(app: &mut App, ui: &mut egui::Ui, heading: &str, sending: Sending) {
     let palette = app.palette;
     ui.spacing_mut().item_spacing.y = 4.0;
     let height = ui.ctx().content_rect().height();
@@ -619,18 +1012,10 @@ fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
             .clamp(300.0, 800.0)
             .min((height - 48.0).max(1.0)),
     );
-    let heading = if messages.len() == 1 {
-        crate::i18n::gettext(app.locale, "Forward message").into_owned()
-    } else {
-        crate::i18n::ngettext(
-            app.locale,
-            "Forward {count} message",
-            "Forward {count} messages",
-            messages.len() as u32,
-        )
-        .replace("{count}", &messages.len().to_string())
-    };
-    title(ui, app, &heading);
+    title(ui, app, heading);
+    if sending == Sending::Screenshots {
+        screenshot_strip(app, ui);
+    }
     // Lay out the real footer first, upwards from the bottom. Wrapped notes
     // and translated buttons then leave exactly their measured room for the
     // list, rather than relying on a guessed header/footer height.
@@ -640,7 +1025,7 @@ fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
             .max_rect(ui.available_rect_before_wrap())
             .layout(Layout::bottom_up(Align::Min)),
     );
-    forward_footer(app, &mut footer);
+    forward_footer(app, &mut footer, sending);
     let footer_rect = footer.min_rect();
     #[cfg(any(test, feature = "demo"))]
     ui.ctx().data_mut(|data| {
@@ -649,7 +1034,10 @@ fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
     if app.forward_reviewing {
         theme::text(
             ui,
-            crate::i18n::gettext(app.locale, "Forward to these chats?"),
+            match sending {
+                Sending::Messages => crate::i18n::gettext(app.locale, "Forward to these chats?"),
+                Sending::Screenshots => crate::i18n::gettext(app.locale, "Send to these chats?"),
+            },
             theme::medium(14.5),
             palette.text,
         );
@@ -807,8 +1195,12 @@ fn forward(app: &mut App, ui: &mut egui::Ui, messages: &[String]) {
     let _ = list;
 }
 
-fn forward_footer(app: &mut App, ui: &mut egui::Ui) {
+fn forward_footer(app: &mut App, ui: &mut egui::Ui, sending: Sending) {
     let palette = app.palette;
+    let send_label = match sending {
+        Sending::Messages => crate::i18n::gettext(app.locale, "Forward"),
+        Sending::Screenshots => crate::i18n::gettext(app.locale, "Send"),
+    };
     if app.forward_reviewing {
         ui.horizontal(|ui| {
             if theme::pill_button(
@@ -821,14 +1213,7 @@ fn forward_footer(app: &mut App, ui: &mut egui::Ui) {
             {
                 app.actions.push(Action::BackToForwardSelection);
             }
-            if theme::pill_button(
-                ui,
-                &palette,
-                &crate::i18n::gettext(app.locale, "Forward"),
-                true,
-            )
-            .clicked()
-            {
+            if theme::pill_button(ui, &palette, &send_label, true).clicked() {
                 app.actions.push(Action::ConfirmForward);
             }
         });
@@ -842,10 +1227,7 @@ fn forward_footer(app: &mut App, ui: &mut egui::Ui) {
             Action::ReviewForward,
         )
     } else {
-        (
-            crate::i18n::gettext(app.locale, "Forward"),
-            Action::ConfirmForward,
-        )
+        (send_label, Action::ConfirmForward)
     };
     ui.horizontal(|ui| {
         let button_width = ui

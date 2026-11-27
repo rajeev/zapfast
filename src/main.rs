@@ -700,9 +700,13 @@ impl Shell {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
             shot.asked = true;
         }
+        // Its own picture only: a screenshot of a chat the page takes asks
+        // for pictures too, with data of their own.
         let image = ctx.input(|input| {
             input.events.iter().find_map(|event| match event {
-                egui::Event::Screenshot { image, .. } => Some(image.clone()),
+                egui::Event::Screenshot {
+                    image, user_data, ..
+                } if shot.asked && user_data.data.is_none() => Some(image.clone()),
                 _ => None,
             })
         });
