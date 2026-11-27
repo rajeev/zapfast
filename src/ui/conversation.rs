@@ -1,5 +1,7 @@
 //! The open chat: its header, the messages, and the composer.
 
+pub(crate) mod screenshot;
+
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -7033,6 +7035,7 @@ fn message_menu_labels(locale: crate::i18n::Locale) -> Vec<String> {
         gettext(locale, "Pin message"),
         gettext(locale, "Unpin message"),
         gettext(locale, "Forward"),
+        gettext(locale, "Screenshot"),
         gettext(locale, "Open in the viewer"),
         gettext(locale, "Select"),
         gettext(locale, "Copy text"),
@@ -7415,6 +7418,21 @@ fn context_menu(
         )
     {
         actions.push(forward_action(chat, &message.id));
+    }
+    // Only in the chat, where the rows down to its end are loaded.
+    if matches!(origin, MenuOrigin::Chat)
+        && !view.chat.locked
+        && !matches!(message.content, Content::Revoked)
+        && item(
+            ui,
+            Icon::Camera,
+            &crate::i18n::gettext(view.locale, "Screenshot"),
+        )
+    {
+        actions.push(Action::ShowDialog(Dialog::Screenshot {
+            chat: chat.clone(),
+            message: message.id.clone(),
+        }));
     }
     // A photo opens the viewer on its own click; a clip plays in its bubble
     // there, so this is how the album is reached from a chat that holds no
@@ -13537,13 +13555,14 @@ mod reaction_tests {
             assert!(measured.contains(label), "menu width leaves out {label}");
         }
         // The fixtures reach every entry a list row's menu can show. A private
-        // reply starts from the group on screen, so only the chat offers it.
+        // reply starts from the group on screen, and a screenshot from the
+        // chat's loaded rows, so only the chat offers them.
         let undrawn: Vec<&str> = measured
             .iter()
             .map(String::as_str)
             .filter(|label| !labels.iter().any(|drawn| drawn == label))
             .collect();
-        assert_eq!(undrawn, ["Reply privately"]);
+        assert_eq!(undrawn, ["Reply privately", "Screenshot"]);
         // Hover texts are not in the accessibility tree (React with any
         // emoji is, as its button's name).
         labels.extend(["React with any emoji".into(), "Remove your reaction".into()]);

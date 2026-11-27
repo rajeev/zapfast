@@ -98,6 +98,28 @@ In a large window the dialog takes more of the window, so more recipients fit
 at once; it still stays inside a narrow or short one, and searching or changing
 the selection does not collapse the list.
 
+**Screenshot** in a message's menu makes pictures of the chat to share, sized
+for a phone held upright. Choose **This message**, or **From this message to
+the end of the chat**. ZapFast lays the messages out at a phone's width, about
+390 points, and cuts them into portrait pages no taller than 19.5:9, with the
+chat's name and the page number at the top. A page ends before a message that
+would not fit, so each message is whole on one page; only a message taller than
+a page is split, and the next page repeats a little of it so no line is cut in
+half. While the pages are taken, the window shows each one in turn; Cancel or
+Escape stops. Then the recipient picker opens with the pages along its top, and
+**Send** sends every page, in order, to each chat you pick, with the same limit
+and confirmation as forwarding. Click a page to see it full size; the arrows or
+the Left and Right keys move between pages, and Escape goes back to the picker.
+**Save all…** under the pages copies them to a folder you choose, and **Save
+as…** over a page shown full size saves that one; a copy never replaces a file
+already there. One capture makes at most 30 pages. A page is as
+sharp as your display: 780 pixels wide on a 2x screen, 390 on a 1x one. The
+window must be tall enough for a page; in a short window pages are shorter.
+Only messages already loaded in the chat are included, and the pictures show
+stickers and GIFs still. The pages are ordinary, unencrypted PNG files, kept in
+the account's cache only until the next screenshot, so locked chats offer no
+**Screenshot**.
+
 Right-click a group message and choose **Reply privately** to open a direct
 conversation with its sender while quoting the group message. The quote
 survives closing the recipient chat or switching accounts. Locked or

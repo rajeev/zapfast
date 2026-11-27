@@ -20,6 +20,7 @@ On Linux:
 | Stickers and packs | `~/.local/state/zapfast/accounts/<id>/stickers/` | Plain WebP files; each pack is a folder |
 | Wallpaper image | `~/.local/state/zapfast/accounts/<id>/wallpaper.jpg` | Copy of the chosen picture (or `.png`, `.webp`, `.gif`) |
 | Attachments, avatars | `~/.cache/zapfast/accounts/<id>/` | Safe to delete; available files download again when viewed |
+| Last screenshot pages | `~/.cache/zapfast/accounts/<id>/screenshots/` | PNGs of the latest **Screenshot**; replaced by the next one, safe to delete |
 | Last run's log | `~/.local/state/zapfast/zapfast.log` | `--verbose` for more |
 | The run before's log | `~/.local/state/zapfast/zapfast.previous.log` | Kept for one more start |
 | Crash log | `~/.local/state/zapfast/panic.log` | Safe to delete |

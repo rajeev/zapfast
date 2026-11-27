@@ -761,6 +761,9 @@ pub struct App {
     pub forward_reviewing: bool,
     /// How many recipients the forwarding dialog's messages may have.
     pub forward_limit: usize,
+    /// Screenshots of the open chat being taken, or the pages taken while
+    /// the dialog offering to send them is open.
+    pub screenshot: Option<crate::screenshot::Capture>,
     /// The group name being typed in the group info dialog.
     pub group_name_edit: Option<String>,
     /// The group description being typed in the info panel.
@@ -1714,6 +1717,7 @@ impl App {
             forward_recipients: Vec::new(),
             forward_reviewing: false,
             forward_limit: crate::model::FORWARD_LIMIT,
+            screenshot: None,
             group_name_edit: None,
             group_description_edit: None,
             new_contact_to_phone: true,
@@ -1997,6 +2001,8 @@ impl App {
         self.gif_error = None;
         self.forward_recipients.clear();
         self.forward_reviewing = false;
+        // Pages taken in the previous account are its files.
+        self.screenshot = None;
         // The locked folder and the picker show the previous account's chats
         // and stickers.
         if self.locked_folder {
@@ -2876,7 +2882,7 @@ impl App {
             ) if chat == id
         ) || matches!(
             &self.dialog,
-            Some(Dialog::Forward { chat, .. } | Dialog::ConfirmDeleteMessage { chat, .. } | Dialog::ConfirmDeleteSelection { chat, .. })
+            Some(Dialog::Forward { chat, .. } | Dialog::ConfirmDeleteMessage { chat, .. } | Dialog::ConfirmDeleteSelection { chat, .. } | Dialog::Screenshot { chat, .. })
                 if chat == id
         ) {
             self.dialog = None;
@@ -6632,6 +6638,126 @@ impl App {
         }
     }
 
+    /// Starts taking screenshots of the open chat from `message`: its row
+    /// alone (an album's whole row), or with `to_end` every row after it.
+    fn take_screenshot(&mut self, chat: ChatId, message: &str, to_end: bool) {
+        if self
+            .dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog, Dialog::Screenshot { .. }))
+        {
+            self.dialog = None;
+        }
+        // Pages are plain files, so a locked chat is kept out of them, as
+        // from an export.
+        if self.open_chat.as_ref() != Some(&chat) || self.chat(&chat).is_none_or(|chat| chat.locked)
+        {
+            return;
+        }
+        let Some(conversation) = self.conversations.get(&chat) else {
+            return;
+        };
+        let messages = &conversation.messages;
+        let Some(index) = messages.iter().position(|item| item.id == message) else {
+            return;
+        };
+        let starts = crate::ui::conversation::row_starts(messages, false);
+        let row = starts
+            .partition_point(|start| *start <= index)
+            .saturating_sub(1);
+        let first = starts.get(row).copied().unwrap_or(index);
+        let mut last = if to_end {
+            messages.len() - 1
+        } else {
+            starts.get(row + 1).map_or(messages.len(), |next| *next) - 1
+        };
+        let truncated = last + 1 - first > crate::screenshot::MAX_MESSAGES;
+        if truncated {
+            last = first + crate::screenshot::MAX_MESSAGES - 1;
+            // End on a whole row.
+            if let Some(next) = starts.iter().find(|start| **start > last) {
+                last = next.saturating_sub(1).max(first);
+            }
+        }
+        let (Some(from), Some(to)) = (messages.get(first), messages.get(last)) else {
+            return;
+        };
+        log::info!("taking screenshots of {} messages", last + 1 - first);
+        self.screenshot = Some(crate::screenshot::Capture::new(
+            self.account().id.clone(),
+            chat,
+            from.id.clone(),
+            to.id.clone(),
+            truncated,
+        ));
+        self.open_message_menu = None;
+        self.reaction_target = None;
+    }
+
+    /// Sends the screenshot pages to the chats picked in their dialog, each
+    /// chat getting every page, in order.
+    fn send_screenshots(&mut self) {
+        let confirmed = match self.forward_recipients.len() {
+            0 => false,
+            1 => true,
+            _ => self.forward_reviewing,
+        };
+        // The pages are the capturing account's files, and go from it only.
+        let Some(crate::screenshot::Phase::Done { paths, .. }) = self
+            .screenshot
+            .as_ref()
+            .filter(|capture| capture.account == self.account().id)
+            .map(|capture| &capture.phase)
+        else {
+            self.dialog = None;
+            self.screenshot = None;
+            return;
+        };
+        if !confirmed || paths.is_empty() || self.forward_recipients.len() > self.forward_limit {
+            return;
+        }
+        let paths = paths.clone();
+        let writable: std::collections::HashSet<_> = self
+            .chats
+            .iter()
+            .filter(|chat| {
+                crate::ui::dialogs::forwardable(chat) && !self.blocklist.contains(&chat.id)
+            })
+            .map(|chat| chat.id.clone())
+            .collect();
+        if !self
+            .forward_recipients
+            .iter()
+            .all(|id| writable.contains(id))
+        {
+            self.forward_recipients.retain(|id| writable.contains(id));
+            self.forward_reviewing = false;
+            self.toast_error(
+                crate::i18n::gettext(self.locale, "A selected chat is no longer writable")
+                    .into_owned(),
+            );
+            return;
+        }
+        for chat in std::mem::take(&mut self.forward_recipients) {
+            self.backend.send(Command::SendFiles {
+                chat,
+                paths: paths.clone(),
+                documents: false,
+                view_once: false,
+                caption: None,
+                mentions: Vec::new(),
+                quoting: None,
+            });
+        }
+        self.follow_sent_chat();
+        self.dialog = None;
+        self.forward_search.clear();
+        self.forward_reviewing = false;
+        // The files stay until the next capture replaces them: the worker
+        // reads each one as its upload starts.
+        self.screenshot = None;
+    }
+
     /// Asks the chat list to follow a sent message's chat to the top. The list
     /// goes only if it was near the top already: a reader working down through
     /// older chats keeps their place.
@@ -8210,8 +8336,10 @@ impl App {
                 });
             }
             Action::ToggleForwardRecipient(id) => {
-                if !matches!(self.dialog, Some(Dialog::Forward { .. }))
-                    || self.forward_reviewing
+                if !matches!(
+                    self.dialog,
+                    Some(Dialog::Forward { .. } | Dialog::ShareScreenshots(_))
+                ) || self.forward_reviewing
                     || self.blocklist.contains(&id)
                     || !self.chat(&id).is_some_and(Chat::can_send)
                 {
@@ -8228,14 +8356,20 @@ impl App {
                 }
             }
             Action::ReviewForward => {
-                if matches!(self.dialog, Some(Dialog::Forward { .. }))
-                    && self.forward_recipients.len() > 1
+                if matches!(
+                    self.dialog,
+                    Some(Dialog::Forward { .. } | Dialog::ShareScreenshots(_))
+                ) && self.forward_recipients.len() > 1
                 {
                     self.forward_reviewing = true;
                 }
             }
             Action::BackToForwardSelection => self.forward_reviewing = false,
             Action::ConfirmForward => {
+                if matches!(self.dialog, Some(Dialog::ShareScreenshots(_))) {
+                    self.send_screenshots();
+                    return;
+                }
                 let Some(Dialog::Forward { chat, messages }) = self.dialog.clone() else {
                     return;
                 };
@@ -8283,6 +8417,51 @@ impl App {
                 self.forward_search.clear();
                 self.forward_reviewing = false;
                 self.selection = None;
+            }
+            Action::TakeScreenshot {
+                chat,
+                message,
+                to_end,
+            } => self.take_screenshot(chat, &message, to_end),
+            Action::CancelScreenshot => self.screenshot = None,
+            Action::ViewScreenshot(page) => {
+                if matches!(self.dialog, Some(Dialog::ShareScreenshots(_)))
+                    && let Some(capture) = &mut self.screenshot
+                {
+                    capture.view(page);
+                }
+            }
+            Action::ScreenshotsTaken => {
+                let Some((chat, truncated, pages)) = self
+                    .screenshot
+                    .as_ref()
+                    .map(|capture| (capture.chat.clone(), capture.truncated, capture.pages.len()))
+                else {
+                    return;
+                };
+                if truncated {
+                    self.toast(
+                        crate::i18n::ngettext(
+                            self.locale,
+                            "Only the first {count} page was taken",
+                            "Only the first {count} pages were taken",
+                            pages as u32,
+                        )
+                        .replace("{count}", &pages.to_string()),
+                    );
+                }
+                self.forward_search.clear();
+                self.forward_recipients.clear();
+                self.forward_reviewing = false;
+                self.forward_limit = crate::model::FORWARD_LIMIT;
+                self.dialog = Some(Dialog::ShareScreenshots(chat));
+            }
+            Action::ScreenshotFailed(error) => {
+                self.screenshot = None;
+                log::warn!("screenshots failed: {error}");
+                self.toast_error(
+                    crate::i18n::gettext(self.locale, "Could not take the screenshot").into_owned(),
+                );
             }
             Action::StartSelection => {
                 // Choosing it again keeps what is already ticked.
@@ -9188,6 +9367,12 @@ impl App {
                 self.forward_search.clear();
                 self.forward_recipients.clear();
                 self.forward_reviewing = false;
+                // The pages offered go with their dialog.
+                if self.screenshot.as_ref().is_some_and(|capture| {
+                    matches!(capture.phase, crate::screenshot::Phase::Done { .. })
+                }) {
+                    self.screenshot = None;
+                }
                 self.contact_edit = None;
                 self.group_name_edit = None;
                 self.group_description_edit = None;
